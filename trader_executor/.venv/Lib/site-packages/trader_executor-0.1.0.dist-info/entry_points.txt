@@ -1,2 +1,0 @@
-[console_scripts]
-trader-executor = trader_executor.__main__:main
