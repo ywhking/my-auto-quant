@@ -2,12 +2,12 @@
   "users": [
     {
       "name": "initiator",
-      "password": "xxxxxxx",
+      "password": "70a1028d-1884-4e4a-ac5c-ab19e5eef14a",
       "role": "initiator"
     },
     {
       "name": "executor",
-      "password": "xxxxxxx",
+      "password": "3a77fe71-08ce-47e4-afd6-4471dda13ef9",
       "role": "executor"
     }
   ]

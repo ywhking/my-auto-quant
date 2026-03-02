@@ -1,16 +1,16 @@
 {
   "proxy": {
-    "host": "trade.kuduoduo.net",
-    "port": 443,
+    "host": "localhost",
+    "port": 8000,
     "ws_path": "/ws",
     "token_path": "/auth"
   },
   "auth": {
     "username": "initiator",
-    "password": "xxxxxxx"
+    "password": "70a1028d-1884-4e4a-ac5c-ab19e5eef14a"
   },
   "timeout": 30,
-  "use_https": true,
+  "use_https": false,
   "verify_ssl": false,
   "logging": {
     "level": "INFO",
