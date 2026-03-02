@@ -71,3 +71,6 @@ logs/
 # QMT specific
 *.qmt
 qmt_data/
+
+# history 
+.history
