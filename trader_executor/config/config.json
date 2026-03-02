@@ -1,0 +1,35 @@
+{
+  "proxy": {
+    "host": "trade.kuduoduo.net",
+    "port": 443,
+    "ws_path": "/ws",
+    "token_path": "/auth",
+    "use_ssl": true
+  },
+  "auth": {
+    "username": "executor",
+    "password": "xxxxxxx"
+  },
+  "qmt": {
+    "account_id": "8885385377",
+    "password": "your_qmt_password",
+    "min_path": "D:\\国金证券QMT交易端\\userdata_mini"
+  },
+  "connection": {
+    "heartbeat_interval": 30,
+    "max_reconnect_attempts": 10,
+    "reconnect_backoff_base": 2,
+    "initial_reconnect_delay": 1,
+    "max_reconnect_delay": 60
+  },
+  "trading": {
+    "lot_size": 100,
+    "min_tick": 0.01,
+    "market_open": "09:30:00",
+    "market_close": "15:00:00"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/executor.log"
+  }
+}

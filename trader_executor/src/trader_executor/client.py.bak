@@ -1,0 +1,380 @@
+"""Main WebSocket client for trader_executor.
+
+This module provides the ExecutorClient that connects to QMT Proxy via
+WebSocket, receives trading messages, executes orders via QMT client,
+and returns execution results.
+"""
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+import aiohttp
+import websockets
+
+from trader_executor.config import ExecutorConfig
+from trader_executor.exceptions import (
+    QMTConnectionError,
+    QMTExecutionError,
+)
+from trader_executor.idempotency import IdempotencyHandler
+from trader_executor.models import ExecutionResult, TradingMessage
+from trader_executor.qmt_client import QMTClientWrapper
+from trader_executor.risk_checker import RiskChecker, RiskCheckError
+
+logger = logging.getLogger(__name__)
+
+class ExecutorClient:
+    """WebSocket client for connecting to QMT Proxy.
+
+    This client:
+    - Maintains persistent connection to QMT Proxy
+    - Receives trading messages and executes via QMT
+    - Returns execution results to proxy
+    - Handles auto-reconnection with exponential backoff
+    - Monitors connection health
+    - Performs risk checks before order execution
+    - Handles idempotency to prevent duplicate orders
+
+    Attributes:
+        config: Configuration object
+        qmt_client: QMT client wrapper instance
+        is_running: Client running state
+        websocket: Current WebSocket connection
+        risk_checker: Risk management checker
+        idempotency: Idempotency handler
+    """
+
+    def __init__(self, config: ExecutorConfig | None = None) -> None:
+        """Initialize ExecutorClient.
+
+        Args:
+            config: Optional configuration object (uses default if None)
+        """
+        self.config = config or ExecutorConfig()
+        self.qmt_client = QMTClientWrapper(self.config)
+        self.risk_checker = RiskChecker(self.config)
+        self.idempotency = IdempotencyHandler(ttl=86400)
+        self.is_running = False
+        self.websocket: websockets.WebSocketClientProtocol | None = None
+        self._reconnect_attempts = 0
+        self._stop_event = asyncio.Event()
+
+    async def start(self) -> None:
+        """Start the executor client.
+
+        Connects to QMT client and establishes persistent WebSocket
+        connection to QMT Proxy. Handles auto-reconnection on failures.
+        """
+        logger.info("Starting executor client...")
+
+        # Connect to QMT first
+        try:
+            await self.qmt_client.connect()
+            logger.info("QMT client connected")
+        except QMTConnectionError as e:
+            # 连接QMT失败，记录错误并停止客户端
+            logger.error(f"Failed to connect to QMT: {e}")
+            raise
+
+        # Connect to QMT_PROXY via websocket
+        try:
+            await self._connect_and_run()
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
+            # 退出前先关闭QMT连接
+            await self.qmt_client.disconnect()
+            raise
+
+    async def _connect_and_run(self) -> None:
+        """Connect to WebSocket and run message loop."""
+        token = await self._get_token()
+        ws_url = (
+            f"{self.config.ws_url}{self.config.ws_path}?token={token}&role=executor"
+        )
+
+        logger.info(f"Connecting to WebSocket: {ws_url}")
+
+        # Get SSL context for secure connections
+        ssl_context = self.config.get_ssl_context()
+
+        async with websockets.connect(
+            ws_url,
+            close_timeout=self.config.heartbeat_interval,
+            ping_interval=self.config.heartbeat_interval,
+            ssl=ssl_context,
+        ) as websocket:
+            self.websocket = websocket
+            logger.info("WebSocket connected")
+
+            # Reset reconnect attempts on successful connection
+            self._reconnect_attempts = 0
+
+            # Run message loop
+            await self._message_loop(websocket)
+
+    async def _message_loop(
+        self, websocket: websockets.WebSocketClientProtocol
+    ) -> None:
+        """Process incoming messages from WebSocket.
+
+        Args:
+            websocket: WebSocket connection
+        """
+        try:
+            async for message in websocket:
+                if self._stop_event.is_set():
+                    break
+                await self._process_message(message, websocket)
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"WebSocket connection closed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Error in message loop: {e}")
+            raise
+
+    async def _process_message(
+        self, message: str, websocket: websockets.WebSocketClientProtocol
+    ) -> None:
+        """Process a single trading message.
+
+        Args:
+            message: JSON string from proxy
+            websocket: WebSocket connection for response
+        """
+        try:
+            # Parse message
+            data = json.loads(message)
+            logger.debug(f"Received message: {data}")
+
+            # Validate with Pydantic model
+            trading_msg = TradingMessage(**data)
+
+            # Extract order_id for idempotency check
+            order_id = data.get("order_id")
+
+            logger.info(
+                f"Processing order: order_id={order_id}, stock={trading_msg.stock}, "
+                f"action={trading_msg.action}, price={trading_msg.price}, "
+                f"number={trading_msg.number}"
+            )
+
+            # Check idempotency - return cached result if duplicate
+            if order_id:
+                is_duplicate, cached_result = await self.idempotency.check_and_set(
+                    order_id
+                )
+                if is_duplicate:
+                    logger.info(
+                        f"Duplicate order detected, returning cached result: order_id={order_id}"
+                    )
+                    if cached_result:
+                        await websocket.send(json.dumps(cached_result))
+                        return
+                    # If no cached result, continue but don't execute again
+
+            # Run risk checks before execution
+            risk_passed, risk_error = self.risk_checker.check_all(
+                stock=trading_msg.stock,
+                action=trading_msg.action,
+                price=trading_msg.price,
+                number=trading_msg.number,
+            )
+
+            if not risk_passed:
+                logger.warning(f"Risk check failed: {risk_error}")
+                result = ExecutionResult(
+                    status="error",
+                    order_id=order_id,
+                    message=f"Risk check failed: {risk_error}",
+                )
+                await websocket.send(result.model_dump_json())
+                return
+
+            # Execute order
+            order_id_value = await self.qmt_client.place_order(
+                trading_msg.stock,
+                trading_msg.action,
+                trading_msg.price,
+                trading_msg.number,
+            )
+
+            # Build response data
+            response_data = {
+                "stock": trading_msg.stock,
+                "action": trading_msg.action,
+                "price": trading_msg.price,
+                "number": trading_msg.number,
+            }
+            result = ExecutionResult(
+                status="success",
+                order_id=str(order_id_value),
+                data=response_data,
+            )
+
+            # Cache result for idempotency
+            if order_id:
+                await self.idempotency.set_result(order_id, result.model_dump())
+
+            await websocket.send(result.model_dump_json())
+            logger.info(f"Order executed successfully: order_id={order_id_value}")
+
+        except json.JSONDecodeError as e:
+            error_msg = f"Invalid JSON message: {e}"
+            logger.error(error_msg)
+            result = ExecutionResult(
+                status="error",
+                order_id=None,
+                message=error_msg,
+            )
+            await websocket.send(result.model_dump_json())
+
+        except ValueError as e:
+            # Pydantic validation error
+            error_msg = f"Validation error: {e}"
+            logger.error(error_msg)
+            result = ExecutionResult(
+                status="error",
+                order_id=None,
+                message=error_msg,
+            )
+            await websocket.send(result.model_dump_json())
+
+        except RiskCheckError as e:
+            error_msg = f"Risk check error: {e}"
+            logger.warning(error_msg)
+            result = ExecutionResult(
+                status="error",
+                order_id=None,
+                message=error_msg,
+            )
+            await websocket.send(result.model_dump_json())
+
+        except (QMTExecutionError, QMTConnectionError) as e:
+            error_msg = f"QMT error: {e}"
+            logger.error(error_msg)
+            result = ExecutionResult(
+                status="error",
+                order_id=None,
+                message=error_msg,
+            )
+            await websocket.send(result.model_dump_json())
+
+        except Exception as e:
+            error_msg = f"Unexpected error: {e}"
+            logger.error(error_msg, exc_info=True)
+            result = ExecutionResult(
+                status="error",
+                order_id=None,
+                message=error_msg,
+            )
+            await websocket.send(result.model_dump_json())
+
+    async def _get_token(self) -> str:
+        """Get authentication token from QMT Proxy.
+
+        Returns:
+            Authentication token string
+
+        Raises:
+            ConnectionError: If token request fails
+        """
+        url = f"{self.config.token_url}?userName={self.config.username}&password={self.config.password}"
+
+        # Get SSL context for HTTPS connections
+        ssl_context = self.config.get_ssl_context()
+
+        try:
+            # Create aiohttp connector with SSL context
+            if ssl_context is not None:
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+            else:
+                connector = aiohttp.TCPConnector()
+
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        token = data["token"]
+                        logger.debug("Token obtained successfully")
+                        return token
+                    error_msg = f"Authentication failed: HTTP {response.status}"
+                    logger.error(error_msg)
+                    raise ConnectionError(error_msg)
+        except (aiohttp.ClientError, json.JSONDecodeError) as e:
+            error_msg = f"Failed to get token: {e}"
+            logger.error(error_msg)
+            raise ConnectionError(error_msg) from e
+
+    async def _should_reconnect(self) -> bool:
+        """Check if should attempt reconnection.
+
+        Returns:
+            True if should reconnect, False otherwise
+        """
+        if self._stop_event.is_set():
+            return False
+
+        if self._reconnect_attempts >= self.config.max_reconnect_attempts:
+            logger.error(
+                f"Max reconnect attempts ({self.config.max_reconnect_attempts}) reached"
+            )
+            return False
+
+        return True
+
+    async def _reconnect_delay(self) -> None:
+        """Wait before reconnecting with exponential backoff."""
+        self._reconnect_attempts += 1
+        delay = min(
+            self.config.initial_reconnect_delay
+            * (self.config.reconnect_backoff_base ** (self._reconnect_attempts - 1)),
+            self.config.max_reconnect_delay,
+        )
+        logger.info(
+            f"Reconnecting in {delay}s (attempt {self._reconnect_attempts}/{self.config.max_reconnect_attempts})"
+        )
+        # Wait for delay, but check stop_event periodically to allow quick shutdown
+        wait_interval = 0.5  # Check every 0.5 seconds
+        elapsed = 0.0
+        while elapsed < delay and not self._stop_event.is_set():
+            await asyncio.sleep(wait_interval)
+            elapsed += wait_interval
+
+    async def stop(self) -> None:
+        """Stop the executor client.
+
+        Closes WebSocket connection and disconnects from QMT.
+        """
+        logger.info("Stopping executor client...")
+        self._stop_event.set()
+        self.is_running = False
+
+        # Close WebSocket if open
+        if self.websocket:
+            try:
+                await self.websocket.close()
+                logger.info("WebSocket closed")
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {e}")
+
+        # Disconnect from QMT
+        try:
+            await self.qmt_client.disconnect()
+        except Exception as e:
+            logger.error(f"Error disconnecting from QMT: {e}")
+
+        # Stop idempotency handler
+        await self.idempotency.stop()
+
+        logger.info("Executor client stopped")
+
+    async def __aenter__(self) -> "ExecutorClient":
+        """Async context manager entry."""
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Async context manager exit."""
+        await self.stop()

@@ -1,0 +1,14 @@
+{
+  "users": [
+    {
+      "name": "initiator",
+      "password": "xxxxxxx",
+      "role": "initiator"
+    },
+    {
+      "name": "executor",
+      "password": "xxxxxxx",
+      "role": "executor"
+    }
+  ]
+}

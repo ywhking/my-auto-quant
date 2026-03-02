@@ -1,0 +1,2 @@
+[console_scripts]
+trader-initiator = trader_initiator.__main__:main

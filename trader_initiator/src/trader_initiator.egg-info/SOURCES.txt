@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+src/trader_initiator/__init__.py
+src/trader_initiator/__main__.py
+src/trader_initiator/client.py
+src/trader_initiator/config.py
+src/trader_initiator/exceptions.py
+src/trader_initiator.egg-info/PKG-INFO
+src/trader_initiator.egg-info/SOURCES.txt
+src/trader_initiator.egg-info/dependency_links.txt
+src/trader_initiator.egg-info/entry_points.txt
+src/trader_initiator.egg-info/requires.txt
+src/trader_initiator.egg-info/top_level.txt
+tests/test_client.py
+tests/test_exceptions.py

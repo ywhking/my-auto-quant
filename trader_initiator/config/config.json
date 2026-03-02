@@ -1,0 +1,19 @@
+{
+  "proxy": {
+    "host": "trade.kuduoduo.net",
+    "port": 443,
+    "ws_path": "/ws",
+    "token_path": "/auth"
+  },
+  "auth": {
+    "username": "initiator",
+    "password": "xxxxxxx"
+  },
+  "timeout": 30,
+  "use_https": true,
+  "verify_ssl": false,
+  "logging": {
+    "level": "INFO",
+    "file": "logs/initiator.log"
+  }
+}
